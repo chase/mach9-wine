@@ -239,6 +239,7 @@ extern struct _KUSER_SHARED_DATA *user_shared_data;
 extern ULONG process_cookie;
 
 extern void init_environment(void);
+extern WCHAR *find_env_var( WCHAR *env, SIZE_T size, const WCHAR *name, SIZE_T namelen );
 extern void init_startup_info(void);
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
@@ -247,7 +248,7 @@ extern char *get_alternate_wineloader( WORD machine );
 extern int get_compat_large_address_aware(void);
 extern int get_compat_force_nx(void);
 extern int get_compat_linger_at_exit(void);
-extern char *get_compat_named_loader( const UNICODE_STRING *image, const WCHAR *env, size_t env_len, int *lease );
+extern char *get_compat_named_loader( const UNICODE_STRING *image, WCHAR *env, size_t env_len, int *lease );
 extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info,
                                  char *named_loader, int lease );
 extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,

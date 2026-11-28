@@ -734,7 +734,7 @@ static void preloader_exec( char **argv )
 }
 
 #if defined(__APPLE__) && defined(__aarch64__)
-static size_t (*resolve_display_name)( const WCHAR *, size_t, const WCHAR *, size_t, char *, size_t );
+static size_t (*resolve_display_name)( const char *, const char *, char *, size_t );
 static const char *named_loader_title;
 
 const char *ntdll_get_named_loader_title(void)
@@ -742,11 +742,12 @@ const char *ntdll_get_named_loader_title(void)
     return named_loader_title;
 }
 
-static char *named_loader_for_title( const char *title, size_t len, size_t capacity, int *lease, BOOL early )
+static char *named_loader_for_image( const char *image, const char *appid, int *lease, BOOL early )
 {
-    char *path;
+    char title[241], *path;
+    size_t len = resolve_display_name( image, appid, title, sizeof(title) );
 
-    if (!len || len >= capacity || title[len]) return NULL;
+    if (!len || len >= sizeof(title) || title[len]) return NULL;
     path = prepare_named_loader( ntdll_dir, title, lease );
     if (!path)
     {
@@ -757,17 +758,41 @@ static char *named_loader_for_title( const char *title, size_t len, size_t capac
     }
     return path;
 }
+
+static char *named_loader_utf8( const WCHAR *text, DWORD size )
+{
+    DWORD len;
+    char *ret;
+
+    if (RtlUnicodeToUTF8N( NULL, 0, &len, text, size ) < 0 || !(ret = malloc( (size_t)len + 1 ))) return NULL;
+    if (RtlUnicodeToUTF8N( ret, len, &len, text, size ) < 0 || memchr( ret, 0, len ))
+    {
+        free( ret );
+        return NULL;
+    }
+    ret[len] = 0;
+    return ret;
+}
 #endif
 
-char *get_compat_named_loader( const UNICODE_STRING *image, const WCHAR *env, size_t env_len, int *lease )
+char *get_compat_named_loader( const UNICODE_STRING *image, WCHAR *env, size_t env_len, int *lease )
 {
 #if defined(__APPLE__) && defined(__aarch64__)
-    char title[241];
-    size_t len;
+    static const WCHAR appidW[] = {'S','t','e','a','m','A','p','p','I','d'};
+    char *image_utf8, *appid = NULL, *path;
+    const WCHAR *var;
 
-    if (!resolve_display_name || !image->Length || !env_len || build_dir) return NULL;
-    len = resolve_display_name( image->Buffer, image->Length / sizeof(WCHAR), env, env_len, title, sizeof(title) );
-    return named_loader_for_title( title, len, sizeof(title), lease, FALSE );
+    if (!resolve_display_name || !image->Length || build_dir) return NULL;
+    if (!(image_utf8 = named_loader_utf8( image->Buffer, image->Length ))) return NULL;
+    if (env_len && (var = find_env_var( env, env_len, appidW, ARRAY_SIZE(appidW) )))
+    {
+        var += ARRAY_SIZE(appidW) + 1;
+        appid = named_loader_utf8( var, wcslen(var) * sizeof(WCHAR) );
+    }
+    path = named_loader_for_image( image_utf8, appid, lease, FALSE );
+    free( appid );
+    free( image_utf8 );
+    return path;
 #else
     return NULL;
 #endif
@@ -2151,6 +2176,20 @@ static ULONG_PTR get_image_address(void)
     return 0;
 }
 
+static void *open_compatdb( const char *filename )
+{
+    char *path;
+    void *handle;
+
+    if (asprintf( &path, "%s/%s", ntdll_dir, filename ) == -1) return NULL;
+    handle = dlopen( path, RTLD_LOCAL | RTLD_LAZY );
+    free( path );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (handle) resolve_display_name = dlsym( handle, "compatdb_lookup_display_name" );
+#endif
+    return handle;
+}
+
 #if defined(__APPLE__) && defined(__aarch64__)
 /* Presence of this marker tells the library constructor to defer applying the
  * current process's rules until load_compatdb() below. */
@@ -2161,25 +2200,20 @@ static void *early_compatdb;
  * DOS path conversion API or wineserver connection exists at this point. */
 static void exec_named_initial_loader( char **argv )
 {
-    size_t (*resolve)( const char *, const char *, char *, size_t );
-    char *name, title[241], **var, *appid = NULL;
-    size_t len;
+    char *name, **var, *appid = NULL;
     int lease = -1;
 
     /* Names are opt-in. Most launches only need the normal compatdb load. */
     if (build_dir || (!getenv( "WINE_COMPATDB" ) && !getenv( "WINE_COMPATDB_FILE" ))) return;
-    if (asprintf( &name, "%s/compatdb-before-image.so", ntdll_dir ) == -1) return;
-    early_compatdb = dlopen( name, RTLD_LOCAL | RTLD_LAZY );
-    free( name );
-    if (!early_compatdb || !(resolve = dlsym( early_compatdb, "compatdb_resolve_unix_display_name" ))) return;
+    early_compatdb = open_compatdb( "compatdb-before-image.so" );
+    if (!resolve_display_name) return;
     for (var = environ; *var; ++var)
         if (!strncasecmp( *var, "SteamAppId=", sizeof("SteamAppId=") - 1 ))
         {
             appid = *var + sizeof("SteamAppId=") - 1;
             break;
         }
-    len = resolve( argv[1], appid, title, sizeof(title) );
-    if (!(name = named_loader_for_title( title, len, sizeof(title), &lease, TRUE ))) return;
+    if (!(name = named_loader_for_image( argv[1], appid, &lease, TRUE ))) return;
     if (inherit_named_loader( lease, name, ntdll_dir ))
     {
         exec_loader_image( name, argv );
@@ -2199,28 +2233,20 @@ static void exec_named_initial_loader( char **argv )
  */
 static void load_compatdb(void)
 {
-    char *name;
     void *handle = NULL;
 
 #if defined(__APPLE__) && defined(__aarch64__)
     handle = early_compatdb;
 #endif
-    if (!handle)
+    if (!handle && !(handle = open_compatdb( "compatdb.so" )))
     {
-        if (asprintf( &name, "%s/compatdb.so", ntdll_dir ) == -1) return;
-        handle = dlopen( name, RTLD_LOCAL | RTLD_LAZY );
-        free( name );
-        if (!handle)
-        {
-            WARN( "error loading compatdb.so: %s\n", dlerror() );
-            return;
-        }
+        WARN( "error loading compatdb.so: %s\n", dlerror() );
+        return;
     }
 #if defined(__APPLE__) && defined(__aarch64__)
     {
         void (*apply)(void) = dlsym( handle, "compatdb_apply_current_process" );
         if (apply) apply();
-        resolve_display_name = dlsym( handle, "compatdb_resolve_display_name" );
     }
 #endif
 }

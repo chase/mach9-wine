@@ -910,7 +910,7 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
 }
 
 
-static WCHAR *find_env_var( WCHAR *env, SIZE_T size, const WCHAR *name, SIZE_T namelen )
+WCHAR *find_env_var( WCHAR *env, SIZE_T size, const WCHAR *name, SIZE_T namelen )
 {
     WCHAR *p = env;
 
