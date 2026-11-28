@@ -151,7 +151,7 @@ char *prepare_named_loader( const char *ntdll_dir, const char *title, int *lease
     *lease = -1;
     if (!bundle_name( title, name ) ||
         !(len = confstr( _CS_DARWIN_USER_CACHE_DIR, cache, sizeof(cache) )) || len > sizeof(cache) ||
-        !join_path( root, cache, "wine-named-loaders-v2" ) || !join_path( entry, root, "run.XXXXXX" ) ||
+        !join_path( root, cache, "wine-named-loaders" ) || !join_path( entry, root, "run.XXXXXX" ) ||
         !join_path( src, ntdll_dir, "wine.app" ) || !join_path( ntdll, ntdll_dir, "ntdll.so" ) ||
         (fd = create_entry( root, entry )) == -1) return NULL;
 

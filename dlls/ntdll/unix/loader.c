@@ -2161,7 +2161,7 @@ static void *early_compatdb;
  * DOS path conversion API or wineserver connection exists at this point. */
 static void exec_named_initial_loader( char **argv )
 {
-    size_t (*resolve)( const char *, const char *, const char *, char *, size_t );
+    size_t (*resolve)( const char *, const char *, char *, size_t );
     char *name, title[241], **var, *appid = NULL;
     size_t len;
     int lease = -1;
@@ -2171,14 +2171,14 @@ static void exec_named_initial_loader( char **argv )
     if (asprintf( &name, "%s/compatdb-before-image.so", ntdll_dir ) == -1) return;
     early_compatdb = dlopen( name, RTLD_LOCAL | RTLD_LAZY );
     free( name );
-    if (!early_compatdb || !(resolve = dlsym( early_compatdb, "compatdb_resolve_initial_display_name" ))) return;
+    if (!early_compatdb || !(resolve = dlsym( early_compatdb, "compatdb_resolve_unix_display_name" ))) return;
     for (var = environ; *var; ++var)
         if (!strncasecmp( *var, "SteamAppId=", sizeof("SteamAppId=") - 1 ))
         {
             appid = *var + sizeof("SteamAppId=") - 1;
             break;
         }
-    len = resolve( argv[1], config_dir, appid, title, sizeof(title) );
+    len = resolve( argv[1], appid, title, sizeof(title) );
     if (!(name = named_loader_for_title( title, len, sizeof(title), &lease, TRUE ))) return;
     if (inherit_named_loader( lease, name, ntdll_dir ))
     {
@@ -2219,7 +2219,7 @@ static void load_compatdb(void)
 #if defined(__APPLE__) && defined(__aarch64__)
     {
         void (*apply)(void) = dlsym( handle, "compatdb_apply_current_process" );
-        if (apply) apply(); /* legacy libraries already applied settings in dlopen */
+        if (apply) apply();
         resolve_display_name = dlsym( handle, "compatdb_resolve_display_name" );
     }
 #endif
