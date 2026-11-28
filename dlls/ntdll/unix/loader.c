@@ -744,15 +744,10 @@ const char *ntdll_get_named_loader_title(void)
 
 static char *named_loader_for_title( const char *title, size_t len, size_t capacity, int *lease, BOOL early )
 {
-    char temp[PATH_MAX];
-    size_t i;
     char *path;
 
-    if (!len || len >= capacity || title[0] == '.' || title[len]) return NULL;
-    for (i = 0; i < len; ++i)
-        if ((unsigned char)title[i] < 32 || title[i] == 127 || title[i] == '/') return NULL;
-    if (!(len = confstr( _CS_DARWIN_USER_CACHE_DIR, temp, sizeof(temp) )) || len > sizeof(temp)) return NULL;
-    path = prepare_named_loader( temp, ntdll_dir, title, lease );
+    if (!len || len >= capacity || title[len]) return NULL;
+    path = prepare_named_loader( ntdll_dir, title, lease );
     if (!path)
     {
         /* The initial loader runs before virtual_init() sets up Wine TLS. */
@@ -2171,7 +2166,9 @@ static void exec_named_initial_loader( char **argv )
     size_t len;
     int lease = -1;
 
-    if (build_dir || asprintf( &name, "%s/compatdb-before-image.so", ntdll_dir ) == -1) return;
+    /* Names are opt-in. Most launches only need the normal compatdb load. */
+    if (build_dir || (!getenv( "WINE_COMPATDB" ) && !getenv( "WINE_COMPATDB_FILE" ))) return;
+    if (asprintf( &name, "%s/compatdb-before-image.so", ntdll_dir ) == -1) return;
     early_compatdb = dlopen( name, RTLD_LOCAL | RTLD_LAZY );
     free( name );
     if (!early_compatdb || !(resolve = dlsym( early_compatdb, "compatdb_resolve_initial_display_name" ))) return;
