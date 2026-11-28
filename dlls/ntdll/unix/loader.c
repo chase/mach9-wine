@@ -70,6 +70,9 @@
 # include <mach/mach_error.h>
 # include <mach-o/getsect.h>
 # include <crt_externs.h>
+# ifdef __aarch64__
+#  include "named_loader.h"
+# endif
 # ifndef _POSIX_SPAWN_DISABLE_ASLR
 #  define _POSIX_SPAWN_DISABLE_ASLR 0x0100
 # endif
@@ -683,22 +686,8 @@ char *get_alternate_wineloader( WORD machine )
 }
 
 
-static void preloader_exec( char **argv )
+static void exec_loader_image( const char *path, char **argv )
 {
-#ifdef HAVE_WINE_PRELOADER
-    asprintf( &argv[0], "%s-preloader", argv[1] );
-#ifdef __APPLE__
-    {
-        posix_spawnattr_t attr;
-        posix_spawnattr_init( &attr );
-        posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC | _POSIX_SPAWN_DISABLE_ASLR );
-        posix_spawn( NULL, argv[0], NULL, &attr, argv, *_NSGetEnviron() );
-        posix_spawnattr_destroy( &attr );
-    }
-#endif
-    execv( argv[0], argv );
-    free( argv[0] );
-#endif
 #if defined(__APPLE__) && defined(__aarch64__)
     /* The loader execs itself again to get 4K pages (see loader/main.c), which a plain
      * exec drops. When this process has them, it runs from an entitled loader, and the
@@ -715,24 +704,169 @@ static void preloader_exec( char **argv )
         {
             if (!(err = posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC )) &&
                 !(err = posix_spawnattr_set_4k_page_size_np( &attr )))
-                err = posix_spawn( NULL, argv[1], NULL, &attr, argv + 1, environ );
+                err = posix_spawn( NULL, path, NULL, &attr, argv, environ );
             posix_spawnattr_destroy( &attr );
         }
         errno = err;
         return;
     }
 #endif
-    execv( argv[1], argv + 1 );
+    execv( path, argv );
+}
+
+static void preloader_exec( char **argv )
+{
+#ifdef HAVE_WINE_PRELOADER
+    asprintf( &argv[0], "%s-preloader", argv[1] );
+#ifdef __APPLE__
+    {
+        posix_spawnattr_t attr;
+        posix_spawnattr_init( &attr );
+        posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC | _POSIX_SPAWN_DISABLE_ASLR );
+        posix_spawn( NULL, argv[0], NULL, &attr, argv, *_NSGetEnviron() );
+        posix_spawnattr_destroy( &attr );
+    }
+#endif
+    execv( argv[0], argv );
+    free( argv[0] );
+#endif
+    exec_loader_image( argv[1], argv + 1 );
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+static const char *named_loader_title;
+
+const char *ntdll_get_named_loader_title(void)
+{
+    return named_loader_title;
+}
+
+static BOOL read_app_name( HANDLE root, const char *path, const UNICODE_STRING *value, char *title )
+{
+    union {
+        KEY_VALUE_PARTIAL_INFORMATION info;
+        BYTE bytes[offsetof( KEY_VALUE_PARTIAL_INFORMATION, Data ) + (NAME_MAX + 1) * sizeof(WCHAR)];
+    } data;
+    WCHAR pathW[128];
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attr;
+    NTSTATUS status;
+    HANDLE key;
+    DWORD len, size;
+
+    if (strlen( path ) >= ARRAY_SIZE(pathW)) return FALSE;
+    ascii_to_unicode( pathW, path, strlen(path) + 1 );
+    init_unicode_string( &name, pathW );
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, root, NULL );
+    if (NtOpenKey( &key, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &attr )) return FALSE;
+    status = NtQueryValueKey( key, value, KeyValuePartialInformation, &data, sizeof(data), &size );
+    NtClose( key );
+    if (status || data.info.Type != REG_SZ || data.info.DataLength % sizeof(WCHAR)) return FALSE;
+    if (RtlUnicodeToUTF8N( title, NAME_MAX + 1, &len, (WCHAR *)data.info.Data, data.info.DataLength )) return FALSE;
+    if (len && !title[len - 1]) --len;
+    if (!len || len > NAME_MAX || memchr( title, 0, len )) return FALSE;
+    title[len] = 0;
+    return TRUE;
+}
+
+static BOOL read_app_name_override( const UNICODE_STRING *value, char *title )
+{
+    HANDLE key;
+    BOOL found;
+
+    if (open_hkcu_key( "Software\\Wine", &key )) return FALSE;
+    found = read_app_name( key, "Mac App Names", value, title );
+    NtClose( key );
+    return found;
+}
+
+static BOOL get_steam_app_name( unsigned int id, char *title )
+{
+    static const WCHAR display_nameW[] = {'D','i','s','p','l','a','y','N','a','m','e',0};
+    static const UNICODE_STRING display_name = RTL_CONSTANT_STRING( display_nameW );
+    static const char uninstall[] = "Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App ";
+    static const char * const views[] = {"", "Wow6432Node\\"};
+    char path[128], appid[11];
+    WCHAR appidW[ARRAY_SIZE(appid)];
+    UNICODE_STRING value;
+    unsigned int i;
+
+    snprintf( appid, sizeof(appid), "%u", id );
+    ascii_to_unicode( appidW, appid, strlen(appid) + 1 );
+    init_unicode_string( &value, appidW );
+    if (read_app_name_override( &value, title )) return TRUE;
+
+    /* A native parent can launch games installed by 32-bit Steam. Wine's
+     * Unix NtOpenKey uses the native view for a non-WoW64 caller. */
+    for (i = 0; i < ARRAY_SIZE(views); i++)
+    {
+        snprintf( path, sizeof(path), "\\Registry\\Machine\\Software\\%s%s%u", views[i], uninstall, id );
+        if (read_app_name( NULL, path, &display_name, title )) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Steam sets the AppID in the environment passed to CreateProcessW. */
+static unsigned int get_child_steam_appid( WCHAR *env, size_t env_len )
+{
+    static const WCHAR appidW[] = {'S','t','e','a','m','A','p','p','I','d'};
+    const WCHAR *p;
+    unsigned int id = 0, digit;
+
+    if (!env_len || !(p = find_env_var( env, env_len, appidW, ARRAY_SIZE(appidW) ))) return 0;
+    for (p += ARRAY_SIZE(appidW) + 1; *p; ++p)
+    {
+        digit = *p - '0';
+        if (digit > 9 || id > (UINT_MAX - digit) / 10) return 0;
+        id = id * 10 + digit;
+    }
+    return id;
+}
+#endif
+
+char *get_child_named_loader( const UNICODE_STRING *image, WCHAR *env, size_t env_len, int *lease )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    char title[NAME_MAX + 1];
+    UNICODE_STRING basename;
+    unsigned int id;
+    size_t start;
+
+    if (build_dir) return NULL;
+    id = get_child_steam_appid( env, env_len );
+    if (!id || !get_steam_app_name( id, title ))
+    {
+        start = image->Length / sizeof(WCHAR);
+        while (start && image->Buffer[start - 1] != '\\' && image->Buffer[start - 1] != '/') --start;
+        basename.Length = basename.MaximumLength = image->Length - start * sizeof(WCHAR);
+        if (!basename.Length) return NULL;
+        basename.Buffer = image->Buffer + start;
+        if (!read_app_name_override( &basename, title )) return NULL;
+    }
+    return prepare_named_loader( ntdll_dir, title, lease );
+#else
+    return NULL;
+#endif
 }
 
 /* exec the appropriate wine loader for the specified machine */
-static NTSTATUS loader_exec( char **argv, WORD machine )
+static NTSTATUS loader_exec( char **argv, WORD machine, char *named_loader, int lease )
 {
     static char noexec[] = "WINELOADERNOEXEC=1";
 
     putenv( noexec );
 
     if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((argv[1] = named_loader) && inherit_named_loader( lease, named_loader, ntdll_dir ))
+    {
+        preloader_exec( argv );
+        WARN( "could not exec named loader %s (%d); using default loader\n", debugstr_a(named_loader), errno );
+        unsetenv( NAMED_LOADER_LEASE_ENV );
+        close( lease );
+    }
+#endif
 
     argv[1] = strdup( wineloader );
     preloader_exec( argv );
@@ -745,7 +879,8 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
  *
  * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
  */
-NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info )
+NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info,
+                          char *named_loader, int lease )
 {
     WORD machine = pe_info->machine;
     char preloader_reserve[64], socket_env[64];
@@ -765,7 +900,7 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
         putenv( preloader_reserve );
     }
 
-    return loader_exec( argv, machine );
+    return loader_exec( argv, machine, named_loader, lease );
 }
 
 
@@ -2092,6 +2227,26 @@ static ULONG_PTR get_image_address(void)
     return 0;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Re-exec in place so the game keeps the PID that macOS gave the launcher. */
+static void exec_named_initial_loader( char **argv )
+{
+    const char *title = getenv( "WINE_MACOS_APP_NAME" );
+    char *name;
+    int lease = -1;
+
+    if (build_dir || !title || !(name = prepare_named_loader( ntdll_dir, title, &lease ))) return;
+    if (inherit_named_loader( lease, name, ntdll_dir ))
+    {
+        exec_loader_image( name, argv );
+        fprintf( stderr, "wine: could not exec named loader %s (%d); continuing with default loader\n", name, errno );
+        unsetenv( NAMED_LOADER_LEASE_ENV );
+    }
+    close( lease );
+    free( name );
+}
+#endif
+
 /***********************************************************************
  *           load_compatdb
  *
@@ -2297,7 +2452,7 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
     /* default to 32-bit loader to support 32-bit prefixes */
     if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
 
-    loader_exec( new_argv, machine );
+    loader_exec( new_argv, machine, NULL, -1 );
     fatal_error( "could not exec the wine loader\n" );
 }
 
@@ -2366,11 +2521,25 @@ static void check_command_line( int argc, char *argv[] )
  */
 DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
 {
+    BOOL check_cmdline = !getenv( "WINELOADERNOEXEC" ) || argc <= 1;
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Never retry optional naming in a copy with an unusable inherited lease. */
+    BOOL initial = !getenv( NAMED_LOADER_LEASE_ENV ) && !getenv( "WINESERVERSOCKET" );
+#endif
+
     main_argc = argc;
     main_argv = argv;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((named_loader_title = adopt_named_loader())) check_cmdline = FALSE;
+#endif
 
     init_paths();
-    if (!getenv( "WINELOADERNOEXEC" ) || argc <= 1) check_command_line( argc, argv );
+    if (check_cmdline) check_command_line( argc, argv );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (initial && argc > 1) exec_named_initial_loader( argv );
+    /* A direct launch title belongs to this invocation, including its loader re-execs. */
+    unsetenv( "WINE_MACOS_APP_NAME" );
+#endif
     unsetenv( "WINELOADERNOEXEC" );
 
 #ifdef RLIMIT_NOFILE
